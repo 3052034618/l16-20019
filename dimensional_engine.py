@@ -983,6 +983,9 @@ class Quantity:
 
     def simplify(self) -> "Quantity":
         """尝试匹配一个有名字的导出单位（N, J, W 等）来替换复合量纲。"""
+        if self._unit and self._unit.dimension == self._dimension:
+            if not self._unit.symbol.startswith('sqrt_') and not self._unit.symbol.startswith('pow_'):
+                return self
         reg = self._registry
         candidates = []
         for sym, u in reg.all_units().items():
@@ -991,8 +994,7 @@ class Quantity:
                 if abs(value) >= 1:
                     candidates.append((value, sym, u))
         if candidates:
-            # 选择数值最接近 1 的（或有名字的优先）
-            named = [c for c in candidates if len(c[1]) <= 2]
+            named = [c for c in candidates if len(c[1]) <= 2 and c[1] != '1']
             if named:
                 candidates = named
             candidates.sort(key=lambda c: abs(math.log10(abs(c[0]))))
@@ -1208,21 +1210,18 @@ class Quantity:
 # 表达式解析器 (增强版)
 # ─────────────────────────────────────────────
 _MATH_FUNCTIONS = {
-    # 三角函数 (支持角度: 默认弧度，可指定 deg/rad)
     'sin', 'cos', 'tan', 'asin', 'acos', 'atan',
-    # 双曲函数
     'sinh', 'cosh', 'tanh',
-    # 指数对数
     'sqrt', 'exp', 'log', 'ln', 'log10', 'log2',
-    # 其他
     'abs', 'floor', 'ceil', 'round',
+    'min', 'max', 'pow', 'hypot',
 }
 
 _EXPR_TOKEN_RE = re.compile(r"""
     (?P<NUMBER>-?\d+\.?\d*(?:[eE][+-]?\d+)?) |
     (?P<FUNC>[a-zA-Z][a-zA-Z0-9_]*)(?=\s*\() |
     (?P<UNIT>[a-zA-Z][a-zA-Z0-9_°\u00B0]*) |
-    (?P<OP>[+\-*/^()]) |
+    (?P<OP>[+\-*/^(),]) |
     (?P<TO>\s+to\s+) |
     (?P<WS>\s+)
 """, re.VERBOSE)
@@ -1419,20 +1418,28 @@ class _ExprParser:
             return atom
         return self.atom()
 
-    def _apply_function(self, func_name: str, arg: Quantity) -> Quantity:
-        """
-        应用数学函数到 Quantity，并处理量纲检查。
-
-        参数:
-            func_name: 函数名 (sin, cos, sqrt, etc.)
-            arg: 参数 Quantity
-
-        返回:
-            计算结果 Quantity
-        """
+    def _apply_function(self, func_name: str, args: list) -> Quantity:
         import math
 
-        # 检查是否是角度单位（用于三角函数）
+        _MULTI_ARG = {'min', 'max', 'pow', 'hypot'}
+        _SINGLE_ARG = {
+            'sin', 'cos', 'tan', 'asin', 'acos', 'atan',
+            'sinh', 'cosh', 'tanh',
+            'sqrt', 'exp', 'log', 'ln', 'log10', 'log2',
+            'abs', 'floor', 'ceil', 'round',
+        }
+
+        if func_name in _MULTI_ARG:
+            return self._apply_multi_arg_function(func_name, args)
+
+        if func_name not in _SINGLE_ARG:
+            raise ParseError(f"未知函数: {func_name}")
+
+        if len(args) != 1:
+            raise ParseError(f"函数 '{func_name}' 只接受 1 个参数，但给了 {len(args)} 个")
+
+        arg = args[0]
+
         is_trig = func_name in ('sin', 'cos', 'tan')
         is_inverse_trig = func_name in ('asin', 'acos', 'atan')
         is_hyperbolic = func_name in ('sinh', 'cosh', 'tanh')
@@ -1440,21 +1447,15 @@ class _ExprParser:
         is_power = func_name in ('sqrt',)
         is_rounding = func_name in ('abs', 'floor', 'ceil', 'round')
 
-        # 获取纯数值（处理角度单位转换）
         if is_trig or is_hyperbolic:
-            # 三角函数和双曲函数: 参数必须是无量纲或角度单位
             if arg.dimension.is_dimensionless():
-                # 无量纲，默认弧度
                 value = arg.value_base
             else:
-                # 检查是否是角度单位
                 try:
-                    # 尝试转换为弧度
                     rad_value = arg.to_value('rad')
                     value = rad_value
                 except (DimensionError, KeyError):
                     try:
-                        # 尝试转换为度再转弧度
                         deg_value = arg.to_value('deg')
                         value = math.radians(deg_value)
                     except (DimensionError, KeyError):
@@ -1464,7 +1465,6 @@ class _ExprParser:
                             f"  详细: 请使用 sin(90 deg) 或 sin(pi/2 rad) 或 sin(1.57) 的形式。"
                         )
         elif is_inverse_trig:
-            # 反三角函数: 参数必须是无量纲，结果是弧度（无量纲）
             if not arg.dimension.is_dimensionless():
                 raise DimensionError(
                     f"函数 '{func_name}' 需要无量纲参数，"
@@ -1473,7 +1473,6 @@ class _ExprParser:
                 )
             value = arg.value_base
         elif is_exponential:
-            # 指数和对数: 参数必须是无量纲
             if not arg.dimension.is_dimensionless():
                 raise DimensionError(
                     f"函数 '{func_name}' 需要无量纲参数，"
@@ -1482,10 +1481,8 @@ class _ExprParser:
                 )
             value = arg.value_base
         else:
-            # 其他函数（sqrt, abs, floor, ceil, round）: 可以是任何量纲
             value = arg.value_base
 
-        # 执行计算
         if func_name == 'sin':
             result_value = math.sin(value)
         elif func_name == 'cos':
@@ -1517,51 +1514,147 @@ class _ExprParser:
         elif func_name == 'abs':
             result_value = abs(value)
         elif func_name == 'floor':
-            result_value = math.floor(value)
+            if arg._unit and arg._unit.offset == 0:
+                val_in_unit = arg._unit.from_base(value)
+                result_value = arg._unit.to_base(math.floor(val_in_unit))
+            else:
+                result_value = math.floor(value)
         elif func_name == 'ceil':
-            result_value = math.ceil(value)
+            if arg._unit and arg._unit.offset == 0:
+                val_in_unit = arg._unit.from_base(value)
+                result_value = arg._unit.to_base(math.ceil(val_in_unit))
+            else:
+                result_value = math.ceil(value)
         elif func_name == 'round':
-            result_value = round(value)
+            if arg._unit and arg._unit.offset == 0:
+                val_in_unit = arg._unit.from_base(value)
+                result_value = arg._unit.to_base(round(val_in_unit))
+            else:
+                result_value = round(value)
         else:
             raise ParseError(f"未知函数: {func_name}")
 
-        # 确定结果的量纲和单位
         if is_trig or is_inverse_trig or is_hyperbolic or is_exponential:
-            # 三角函数、反三角函数、双曲函数、指数对数: 结果无量纲
             result_dim = DIMENSIONLESS
-            result_unit = UnitDef("dimensionless", "1", result_dim)
+            result_unit = self.registry['1']
             return Quantity(result_value, result_unit, self.registry)
         elif is_power:
-            # sqrt: 量纲指数除以 2
             result_dim = arg.dimension ** Fraction(1, 2)
-            # 尝试从原单位推导新单位
+            result_base = math.sqrt(arg.value_base)
             if arg._unit and arg._unit.offset == 0:
-                # 简单处理：如果原单位是 m^2，结果单位是 m
-                old_sym = arg._unit.symbol
-                # 尝试创建一个简化的单位符号
-                new_sym = f"sqrt({old_sym})" if '^' in old_sym else old_sym
-                try:
-                    result_unit = UnitDef(f"sqrt_{old_sym}", new_sym, result_dim, factor=math.sqrt(arg._unit.factor))
-                    return Quantity(result_value, result_unit, self.registry)
-                except:
-                    pass
-            result_unit = UnitDef("dimensionless", "1", result_dim)
-            return Quantity(result_value, result_unit, self.registry)
+                result_unit = self._derive_sqrt_unit(arg._unit)
+                result_value = result_unit.from_base(result_base)
+                return Quantity(result_value, result_unit, self.registry)
+            result_unit = self.registry['1']
+            return Quantity.from_base(result_base, result_dim, result_unit, self.registry)
         else:
-            # abs, floor, ceil, round: 保持原有量纲和单位
             result_dim = arg.dimension
+            result_base = result_value  # result_value already computed in base units
             if arg._unit:
-                # 保留原单位
-                return Quantity(result_value, arg._unit, self.registry)
-            result_unit = UnitDef("dimensionless", "1", result_dim)
-            return Quantity(result_value, result_unit, self.registry)
+                result_in_unit = arg._unit.from_base(result_base)
+                return Quantity(result_in_unit, arg._unit, self.registry)
+            result_unit = self.registry['1']
+            return Quantity.from_base(result_base, result_dim, result_unit, self.registry)
+
+    def _derive_sqrt_unit(self, unit: UnitDef) -> UnitDef:
+        import math
+        sym = unit.symbol
+        dim = unit.dimension ** Fraction(1, 2)
+        factor = math.sqrt(unit.factor)
+        if '^2' in sym:
+            new_sym = sym.replace('^2', '')
+        elif '^' in sym:
+            new_sym = f"sqrt({sym})"
+        else:
+            new_sym = sym
+        try:
+            existing = self.registry[new_sym]
+            if existing.dimension == dim and abs(existing.factor - factor) < 1e-15 * max(abs(existing.factor), 1):
+                return existing
+        except (KeyError, UnitDefinitionError):
+            pass
+        return UnitDef(f"sqrt_{sym}", new_sym, dim, factor=factor)
+
+    def _apply_multi_arg_function(self, func_name: str, args: list) -> Quantity:
+        import math
+
+        if func_name in ('min', 'max'):
+            if len(args) < 2:
+                raise ParseError(f"函数 '{func_name}' 至少需要 2 个参数")
+            ref_dim = args[0].dimension
+            for i, a in enumerate(args[1:], 2):
+                if a.dimension != ref_dim:
+                    raise DimensionError(
+                        f"函数 '{func_name}' 的所有参数必须有相同量纲，"
+                        f"但第 1 个参数是 {ref_dim}，第 {i} 个参数是 {a.dimension}"
+                    )
+            base_values = [a.value_base for a in args]
+            if func_name == 'min':
+                result_base = min(base_values)
+            else:
+                result_base = max(base_values)
+            result_unit = args[0]._unit
+            if result_unit:
+                result_value = result_unit.from_base(result_base)
+                return Quantity(result_value, result_unit, self.registry)
+            result_unit = self.registry['1']
+            return Quantity(result_base, result_unit, self.registry)
+
+        if func_name == 'pow':
+            if len(args) != 2:
+                raise ParseError(f"函数 'pow' 需要 2 个参数: pow(base, exponent)")
+            base, exponent = args[0], args[1]
+            if not exponent.dimension.is_dimensionless():
+                raise DimensionError(
+                    f"函数 'pow' 的指数必须是无量纲的，"
+                    f"但得到的量纲是 {exponent.dimension}"
+                )
+            exp_val = exponent.value_base
+            result_dim = base.dimension ** exp_val
+            result_base = base.value_base ** exp_val
+            if base._unit and base._unit.offset == 0:
+                new_factor = base._unit.factor ** exp_val
+                old_sym = base._unit.symbol
+                if exp_val == int(exp_val):
+                    new_sym = f"{old_sym}^{int(exp_val)}" if exp_val != 1 else old_sym
+                else:
+                    new_sym = f"{old_sym}^{exp_val:.4g}"
+                try:
+                    result_unit = UnitDef(f"pow_{old_sym}_{exp_val}", new_sym, result_dim, factor=new_factor)
+                    return Quantity(result_value := result_unit.from_base(result_base), result_unit, self.registry)
+                except Exception:
+                    pass
+            result_unit = self.registry['1']
+            result_value = result_base
+            return Quantity.from_base(result_base, result_dim, result_unit, self.registry)
+
+        if func_name == 'hypot':
+            if len(args) < 2:
+                raise ParseError(f"函数 'hypot' 至少需要 2 个参数")
+            ref_dim = args[0].dimension
+            for i, a in enumerate(args[1:], 2):
+                if a.dimension != ref_dim:
+                    raise DimensionError(
+                        f"函数 'hypot' 的所有参数必须有相同量纲，"
+                        f"但第 1 个参数是 {ref_dim}，第 {i} 个参数是 {a.dimension}"
+                    )
+            base_values = [a.value_base for a in args]
+            result_base = math.sqrt(sum(v * v for v in base_values))
+            result_unit = args[0]._unit
+            if result_unit:
+                result_value = result_unit.from_base(result_base)
+                return Quantity(result_value, result_unit, self.registry)
+            result_unit = self.registry['1']
+            return Quantity(result_base, result_unit, self.registry)
+
+        raise ParseError(f"未知多参数函数: {func_name}")
 
     def atom(self) -> Quantity:
         tok = self.peek()
         if tok is None:
             raise ParseError("表达式意外结束")
 
-        # 函数调用: func(expr)
+        # 函数调用: func(expr) or func(expr, expr, ...)
         if tok[0] == "FUNC":
             func_name = tok[1]
             self.consume()
@@ -1570,15 +1663,25 @@ class _ExprParser:
             if lparen is None or lparen[0] != "OP" or lparen[1] != "(":
                 raise ParseError(f"函数 '{func_name}' 后缺少 '('")
             self.consume()
-            # 解析参数
-            arg = self.expr()
+            # 解析第一个参数
+            first_arg = self.expr()
+            args = [first_arg]
+            # 检查是否有逗号分隔的更多参数
+            while True:
+                comma_tok = self.peek()
+                if comma_tok is not None and comma_tok[0] == "OP" and comma_tok[1] == ",":
+                    self.consume()
+                    next_arg = self.expr()
+                    args.append(next_arg)
+                else:
+                    break
             # 期望右括号
             rparen = self.peek()
             if rparen is None or rparen[0] != "OP" or rparen[1] != ")":
                 raise ParseError(f"函数 '{func_name}' 的参数缺少 ')'")
             self.consume()
             # 应用函数
-            return self._apply_function(func_name, arg)
+            return self._apply_function(func_name, args)
 
         # 括号
         if tok[0] == "OP" and tok[1] == "(":
@@ -1785,17 +1888,18 @@ def q(value: float, unit: str, registry: Optional[UnitRegistry] = None) -> Quant
 # ─────────────────────────────────────────────
 _BANNER = """
 ╔══════════════════════════════════════════════════════════════╗
-║         量纲科学计算器 (交互式) v3.0                         ║
+║         量纲科学计算器 (交互式) v4.0                         ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  输入表达式进行计算，支持:                                   ║
 ║    • 基本运算: 5 kg * 9.8 m/s^2                             ║
 ║    • 隐式乘法: 2m, 3 kg m/s^2                               ║
 ║    • 单位换算: 100 C to K, 100 km/h to m/s                  ║
 ║    • 幂运算: (2 m)^3, m^-2                                  ║
-║    • 数学函数: sin, cos, sqrt, log, exp 等                  ║
+║    • 数学函数: sin, cos, sqrt, log, min, max, pow 等        ║
 ║    • 物理常数: G, c, planck, boltzmann, pi 等               ║
 ║    • 变量赋值: let v = 100 km/h  或  v = 100 km/h           ║
 ║    • 历史命令: :history 查看, !n 或 !-n 重执行              ║
+║    • 表达式库: :save name = expr, @name 复用                ║
 ║    • 定义单位: :def 符号 = 表达式   (例如 :def day = 24 h)  ║
 ║    • 定义别名: :alias 新符号 = 原符号                        ║
 ║    • 删除单位: :del 符号                                    ║
@@ -1938,6 +2042,8 @@ _HELP = """
     :vars                   列出所有变量
     :consts                 列出所有物理常数
     :history                列出计算历史
+    :save 名称 = 表达式     保存常用表达式 (例: :save speed = 100 km/h)
+    :exprs                  列出已保存的表达式
     :help                   显示此帮助
     :q / :quit              退出
 
@@ -1952,6 +2058,11 @@ _HELP = """
     v = 100 km/h            同上
     ans                     上一次计算结果
 
+  表达式库:
+    :save speed = 100 km/h  保存表达式
+    :exprs                  查看已保存的表达式
+    @speed                  在表达式中复用 (展开为保存的表达式)
+
   数学函数:
     sin, cos, tan           三角函数 (支持 deg/rad)
     asin, acos, atan        反三角函数
@@ -1959,6 +2070,9 @@ _HELP = """
     sqrt, exp               平方根、自然指数
     log, ln, log10, log2    对数函数
     abs, floor, ceil, round 取整函数
+    min, max                最小/最大值 (同量纲参数)
+    pow(base, exp)          幂运算
+    hypot(a, b, ...)        向量模 (同量纲参数)
 
   物理常数 (部分常用别名):
     G, c, R, e              万有引力、光速、气体常数、元电荷
@@ -2024,14 +2138,13 @@ def cli() -> int:
     registry = DEFAULT_REGISTRY
     variables: Dict[str, Quantity] = {}
     last_result: Optional[Quantity] = None
-    history: List[Tuple[str, Optional[Quantity]]] = []  # (expression, result)
+    history: List[Tuple[str, Optional[Quantity]]] = []
+    saved_exprs: Dict[str, str] = {}
 
     def _add_to_history(expr: str, result: Optional[Quantity]) -> None:
-        """添加到历史记录。"""
         history.append((expr, result))
 
     def _get_history_entry(n: int) -> Optional[Tuple[str, Optional[Quantity]]]:
-        """获取历史记录条目，支持负数索引。"""
         if n == 0:
             return None
         if n > 0:
@@ -2041,6 +2154,25 @@ def cli() -> int:
         if 0 <= idx < len(history):
             return history[idx]
         return None
+
+    def _expand_saved_exprs(line: str) -> str:
+        """将 @name 展开为保存的表达式文本。"""
+        def _replace(m):
+            name = m.group(1)
+            if name in saved_exprs:
+                return f"({saved_exprs[name]})"
+            return m.group(0)
+        return re.sub(r'@([a-zA-Z_][a-zA-Z0-9_]*)', _replace, line)
+
+    def _build_parse_vars() -> Dict[str, Quantity]:
+        parse_vars = dict(variables)
+        if last_result is not None:
+            parse_vars['ans'] = last_result
+        return parse_vars
+
+    _ASSIGNMENT_RE = re.compile(
+        r'^(?:let\s+|var\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$'
+    )
 
     try:
         while True:
@@ -2055,7 +2187,6 @@ def cli() -> int:
             # 检查历史命令: !n, !-n, !!
             if line.startswith('!'):
                 if line == '!!':
-                    # 上一条命令
                     entry = _get_history_entry(-1)
                 else:
                     try:
@@ -2069,30 +2200,30 @@ def cli() -> int:
                     print(f"  错误: 历史记录中没有该条目")
                     continue
                 
-                expr, _ = entry
-                print(f"  重执行: {expr}")
-                line = expr
+                expr_text, _ = entry
+                print(f"  重执行: {expr_text}")
+                line = expr_text
+
+            # 展开 @name
+            expanded = _expand_saved_exprs(line)
+            if expanded != line:
+                print(f"  展开: {expanded}")
+                line = expanded
 
             # 检查变量赋值: let v = expr 或 var v = expr 或 v = expr
-            assignment_match = re.match(r'^(?:let\s+|var\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$', line)
+            assignment_match = _ASSIGNMENT_RE.match(line)
             if assignment_match:
                 var_name = assignment_match.group(1)
                 var_expr = assignment_match.group(2)
                 try:
-                    # 构建包含 ans 的变量字典
-                    parse_vars = dict(variables)
-                    if last_result is not None:
-                        parse_vars['ans'] = last_result
-                    value = parse(var_expr, registry, parse_vars)
+                    value = parse(var_expr, registry, _build_parse_vars())
                     variables[var_name] = value
                     last_result = value
                     print(f"  已定义变量: {var_name} = {value}")
-                    _print_result(value, indent="  ")
                     _add_to_history(line, value)
-                except (ParseError, DimensionError, UnitDefinitionError) as e:
+                except (ParseError, DimensionError, UnitDefinitionError, KeyError) as e:
                     print(f"  错误: {e}")
-                except Exception as e:
-                    print(f"  错误: 定义变量时发生未知错误 - {e}")
+                    _add_to_history(line, None)
                 continue
 
             if line.startswith(":"):
@@ -2138,12 +2269,10 @@ def cli() -> int:
                     if consts_info:
                         print("  物理常数:")
                         print()
-                        # 找到最大宽度
                         sym_w = max(len(info['symbol']) for info in consts_info)
                         alias_w = max(len(", ".join(info['aliases'])) if info['aliases'] else 0 for info in consts_info)
                         alias_w = max(alias_w, 10)
                         
-                        # 打印表头
                         header = f"  {'符号':<{sym_w}}  {'别名':<{alias_w}}  描述"
                         print(header)
                         print(f"  {'─' * sym_w}  {'─' * alias_w}  {'─' * 30}")
@@ -2154,14 +2283,11 @@ def cli() -> int:
                             aliases = ", ".join(info['aliases']) if info['aliases'] else "-"
                             note = info['note']
                             
-                            # 第一行：符号、别名、描述
                             print(f"  {sym:<{sym_w}}  {aliases:<{alias_w}}  {note}")
-                            # 第二行：数值和量纲
                             val_str = f"    = {qty.value_in_unit():.6g} {qty._unit.symbol if qty._unit else ''}  [{qty.dimension}]"
                             print(val_str)
                             print()
                         
-                        # 显示冲突提示
                         conflicts = [info for info in consts_info if '被' in info.get('note', '')]
                         if conflicts:
                             print("  💡 提示: 以下常用符号与现有单位冲突，已提供别名:")
@@ -2180,30 +2306,46 @@ def cli() -> int:
                         print(f"  {'#':>3}  {'表达式':<40}  结果")
                         print(f"  {'─'*3}  {'─'*40}  {'─'*20}")
                         for i, (expr, result) in enumerate(history, 1):
-                            result_str = f"{result:.6g}" if result else "(错误)"
+                            if result is not None:
+                                result_str = f"{result:.6g}"
+                            else:
+                                result_str = "(错误)"
                             expr_display = expr if len(expr) <= 38 else expr[:36] + "..."
                             print(f"  {i:>3}  {expr_display:<40}  {result_str}")
                         print()
                         print("  使用 !n 重执行第 n 条，!-n 重执行倒数第 n 条，!! 重执行上一条")
                         print()
                     continue
+                if line.startswith(":save"):
+                    save_arg = line[5:].strip()
+                    save_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$', save_arg)
+                    if not save_match:
+                        print("  错误: :save 命令格式应为 :save 名称 = 表达式")
+                        continue
+                    save_name = save_match.group(1)
+                    save_expr = save_match.group(2).strip()
+                    saved_exprs[save_name] = save_expr
+                    print(f"  ✓ 已保存表达式: @{save_name} = {save_expr}")
+                    continue
+                if line == ":exprs":
+                    if saved_exprs:
+                        print("  已保存的表达式:")
+                        for name, expr in saved_exprs.items():
+                            print(f"    @{name} = {expr}")
+                    else:
+                        print("  没有已保存的表达式。使用 :save 名称 = 表达式 来保存。")
+                    continue
                 print(f"  未知命令: {line}。输入 :help 查看命令列表。")
                 continue
 
             try:
-                # 构建包含 ans 的变量字典
-                parse_vars = dict(variables)
-                if last_result is not None:
-                    parse_vars['ans'] = last_result
-                
-                result = parse(line, registry, parse_vars)
+                result = parse(line, registry, _build_parse_vars())
                 last_result = result
                 _print_result(result)
                 _add_to_history(line, result)
             except (ParseError, DimensionError, UnitDefinitionError, KeyError) as e:
                 print(f"  错误: {e}")
-            except Exception as e:
-                print(f"  错误: 计算时发生未知错误 - {e}")
+                _add_to_history(line, None)
 
     except KeyboardInterrupt:
         print("\n\n再见!")
