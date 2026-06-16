@@ -360,6 +360,8 @@ class UnitRegistry:
         self._units: Dict[str, UnitDef] = {}
         self._aliases: Dict[str, str] = {}
         self._constants: Dict[str, Quantity] = {}
+        self._constant_aliases: Dict[str, str] = {}
+        self._constant_notes: Dict[str, str] = {}
         self._constants_initialized = False
         self._init_all()
 
@@ -492,18 +494,28 @@ class UnitRegistry:
         """返回所有别名映射。"""
         return dict(self._aliases)
 
-    def register_constant(self, symbol: str, quantity: Quantity) -> None:
+    def register_constant(
+        self,
+        symbol: str,
+        quantity: Quantity,
+        aliases: Optional[List[str]] = None,
+        note: Optional[str] = None
+    ) -> None:
         """
         注册物理常数。
 
         参数
         ----
-        symbol : str       常数符号 (如 'G', 'c', 'h')
+        symbol : str       常数符号 (如 'G', 'c', 'h_p')
         quantity : Quantity  常数值（带单位）
+        aliases : List[str]  可选别名列表 (如 ['planck', 'h'] 用于 h_p)
+        note : str         可选备注说明 (如 'h 被小时占用，推荐使用 h_p')
 
         示例:
             register_constant('G', parse('6.67430e-11 m^3/kg/s^2'))
-            register_constant('c', parse('299792458 m/s'))
+            register_constant('h_p', parse('6.62607015e-34 J*s'),
+                            aliases=['planck', 'h_const'],
+                            note='h 被小时单位占用，推荐使用 h_p')
         """
         if symbol in self._constants:
             raise UnitDefinitionError(
@@ -514,6 +526,17 @@ class UnitRegistry:
                 f"符号 '{symbol}' 已被单位占用，请使用其他符号。"
             )
         self._constants[symbol] = quantity
+        
+        # 注册别名（只注册不与现有符号冲突的别名）
+        if aliases:
+            for alias in aliases:
+                if alias not in self._units and alias not in self._aliases \
+                        and alias not in self._constants and alias not in self._constant_aliases:
+                    self._constant_aliases[alias] = symbol
+        
+        # 注册备注
+        if note:
+            self._constant_notes[symbol] = note
 
     def _ensure_constants_initialized(self) -> None:
         """确保常数已初始化（延迟初始化）。"""
@@ -525,9 +548,43 @@ class UnitRegistry:
             self._constants_initialized = True
 
     def get_constant(self, symbol: str) -> Optional[Quantity]:
-        """获取物理常数，不存在返回 None。"""
+        """获取物理常数，支持别名查找，不存在返回 None。"""
         self._ensure_constants_initialized()
-        return self._constants.get(symbol)
+        if symbol in self._constants:
+            return self._constants[symbol]
+        if symbol in self._constant_aliases:
+            return self._constants[self._constant_aliases[symbol]]
+        return None
+
+    def get_constant_info(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """获取物理常数的完整信息（符号、数值、别名、备注等）。"""
+        self._ensure_constants_initialized()
+        actual_symbol = symbol
+        if symbol in self._constant_aliases:
+            actual_symbol = self._constant_aliases[symbol]
+        if actual_symbol not in self._constants:
+            return None
+        aliases = [k for k, v in self._constant_aliases.items() if v == actual_symbol]
+        return {
+            'symbol': actual_symbol,
+            'quantity': self._constants[actual_symbol],
+            'aliases': aliases,
+            'note': self._constant_notes.get(actual_symbol, '')
+        }
+
+    def get_all_constants_info(self) -> List[Dict[str, Any]]:
+        """获取所有物理常数的完整信息列表。"""
+        self._ensure_constants_initialized()
+        result = []
+        for symbol, qty in self._constants.items():
+            aliases = [k for k, v in self._constant_aliases.items() if v == symbol]
+            result.append({
+                'symbol': symbol,
+                'quantity': qty,
+                'aliases': aliases,
+                'note': self._constant_notes.get(symbol, '')
+            })
+        return result
 
     def all_constants(self) -> Dict[str, Quantity]:
         """返回所有已注册物理常数的副本。"""
@@ -640,6 +697,12 @@ class UnitRegistry:
         self.register(UnitDef("m/s", "m/s", Dimension(length=1, time=-1)))
         self.register(UnitDef("km/h", "km/h", Dimension(length=1, time=-1), factor=1 / 3.6))
         self.register(UnitDef("knot", "kn", Dimension(length=1, time=-1), factor=0.514444))
+        # 纯数字单位（用于无量纲常数）
+        self.register(UnitDef("unity", "1", DIMENSIONLESS, factor=1.0))
+        # 角度单位（无量纲，但有换算因子）
+        import math
+        self.register(UnitDef("radian", "rad", DIMENSIONLESS, factor=1.0))
+        self.register(UnitDef("degree", "deg", DIMENSIONLESS, factor=math.pi / 180.0))
 
     def _init_aliases(self):
         self.alias("metre", "m", name="metre")
@@ -696,6 +759,8 @@ class UnitRegistry:
         """初始化常用物理常数。"""
         if self._constants_initialized:
             return
+        import math
+        
         # 万有引力常数
         self.register_constant(
             'G',
@@ -703,7 +768,9 @@ class UnitRegistry:
                 6.67430e-11,
                 Dimension(length=3, mass=-1, time=-2),
                 registry=self
-            )
+            ),
+            aliases=['grav', 'gravitational'],
+            note='万有引力常数'
         )
         # 光速
         self.register_constant(
@@ -712,7 +779,9 @@ class UnitRegistry:
                 299792458.0,
                 Dimension(length=1, time=-1),
                 registry=self
-            )
+            ),
+            aliases=['light', 'c0'],
+            note='真空中光速'
         )
         # 普朗克常数 (h 被小时占用，使用 h_p)
         self.register_constant(
@@ -721,26 +790,31 @@ class UnitRegistry:
                 6.62607015e-34,
                 Dimension(mass=1, length=2, time=-1),
                 registry=self
-            )
+            ),
+            aliases=['planck', 'h_const', 'plank'],
+            note='h 被小时单位占用，推荐使用 h_p 或 planck'
         )
         # 约化普朗克常数
-        import math
         self.register_constant(
             'hbar',
             Quantity.from_base(
                 6.62607015e-34 / (2 * math.pi),
                 Dimension(mass=1, length=2, time=-1),
                 registry=self
-            )
+            ),
+            aliases=['h_bar', 'reduced_planck'],
+            note='约化普朗克常数 = h / 2π'
         )
-        # 玻尔兹曼常数
+        # 玻尔兹曼常数 (k 被千前缀占用，使用 k_b)
         self.register_constant(
             'k_b',
             Quantity.from_base(
                 1.380649e-23,
                 Dimension(mass=1, length=2, time=-2, temperature=-1),
                 registry=self
-            )
+            ),
+            aliases=['boltzmann', 'k_const', 'boltzman'],
+            note='k 被千前缀 (k=10^3) 占用，推荐使用 k_b 或 boltzmann'
         )
         # 理想气体常数
         self.register_constant(
@@ -749,7 +823,9 @@ class UnitRegistry:
                 8.314462618,
                 Dimension(mass=1, length=2, time=-2, temperature=-1, amount=-1),
                 registry=self
-            )
+            ),
+            aliases=['gas_constant', 'ideal_gas'],
+            note='理想气体常数 = k_b * N_A'
         )
         # 元电荷
         self.register_constant(
@@ -758,7 +834,9 @@ class UnitRegistry:
                 1.602176634e-19,
                 Dimension(current=1, time=1),
                 registry=self
-            )
+            ),
+            aliases=['electron_charge', 'elementary_charge'],
+            note='元电荷（电子电荷量）'
         )
         # 阿伏伽德罗常数
         self.register_constant(
@@ -767,7 +845,9 @@ class UnitRegistry:
                 6.02214076e23,
                 Dimension(amount=-1),
                 registry=self
-            )
+            ),
+            aliases=['avogadro', 'avogadro_constant'],
+            note='阿伏伽德罗常数'
         )
         # 标准重力加速度 (g 被克占用，使用 g_0)
         self.register_constant(
@@ -776,7 +856,33 @@ class UnitRegistry:
                 9.80665,
                 Dimension(length=1, time=-2),
                 registry=self
-            )
+            ),
+            aliases=['gravity', 'standard_gravity', 'g_const'],
+            note='g 被克单位占用，推荐使用 g_0 或 gravity'
+        )
+        # 圆周率 π
+        self.register_constant(
+            'pi',
+            Quantity.from_base(
+                math.pi,
+                DIMENSIONLESS,
+                unit=self['1'],
+                registry=self
+            ),
+            aliases=['π', 'pi_const'],
+            note='圆周率 π ≈ 3.1415926535'
+        )
+        # 自然对数的底 e
+        self.register_constant(
+            'euler',
+            Quantity.from_base(
+                math.e,
+                DIMENSIONLESS,
+                unit=self['1'],
+                registry=self
+            ),
+            aliases=['e_const', 'napier'],
+            note='e 被元电荷占用，推荐使用 euler 或 e_const (e ≈ 2.71828)'
         )
         # 标准大气压 (已作为单位注册，不再作为常数)
         # self.register_constant(
@@ -787,7 +893,6 @@ class UnitRegistry:
         #         registry=self
         #     )
         # )
-        self._constants_initialized = True
         # 电子伏特 (已作为单位注册，不再作为常数)
         # self.register_constant(
         #     'eV',
@@ -797,6 +902,7 @@ class UnitRegistry:
         #         registry=self
         #     )
         # )
+        self._constants_initialized = True
 
 
 DEFAULT_REGISTRY = UnitRegistry()
@@ -1101,8 +1207,20 @@ class Quantity:
 # ─────────────────────────────────────────────
 # 表达式解析器 (增强版)
 # ─────────────────────────────────────────────
+_MATH_FUNCTIONS = {
+    # 三角函数 (支持角度: 默认弧度，可指定 deg/rad)
+    'sin', 'cos', 'tan', 'asin', 'acos', 'atan',
+    # 双曲函数
+    'sinh', 'cosh', 'tanh',
+    # 指数对数
+    'sqrt', 'exp', 'log', 'ln', 'log10', 'log2',
+    # 其他
+    'abs', 'floor', 'ceil', 'round',
+}
+
 _EXPR_TOKEN_RE = re.compile(r"""
     (?P<NUMBER>-?\d+\.?\d*(?:[eE][+-]?\d+)?) |
+    (?P<FUNC>[a-zA-Z][a-zA-Z0-9_]*)(?=\s*\() |
     (?P<UNIT>[a-zA-Z][a-zA-Z0-9_°\u00B0]*) |
     (?P<OP>[+\-*/^()]) |
     (?P<TO>\s+to\s+) |
@@ -1141,6 +1259,14 @@ def _expr_tokenize(expr: str) -> List[Tuple[str, str]]:
         if kind == "TO":
             raw_tokens.append(("TO", "to"))
             continue
+        if kind == "FUNC":
+            # 验证是否是有效的数学函数
+            if value not in _MATH_FUNCTIONS:
+                # 如果不是已知函数，当作普通 UNIT 处理
+                raw_tokens.append(("UNIT", value))
+            else:
+                raw_tokens.append((kind, value))
+            continue
         raw_tokens.append((kind, value))
     
     # 检查表达式末尾是否有未匹配的字符
@@ -1166,15 +1292,23 @@ def _expr_tokenize(expr: str) -> List[Tuple[str, str]]:
         if kind == "NUMBER" and next_kind == "OP" and next_val == "(":
             need_implicit_mul = True
 
-        # 右括号后面跟数字或单位: (3+4) 2 → (3+4)*2; (3+4)m → (3+4)*m
-        elif kind == "OP" and value == ")" and next_kind in ("NUMBER", "UNIT"):
+        # 数字后面跟函数: 2 sin(x) → 2 * sin(x)
+        elif kind == "NUMBER" and next_kind == "FUNC":
             need_implicit_mul = True
 
-        # 单位后面跟数字或单位或左括号:
-        #   m 2 → m*2; m s → m*s; m (3+4) → m*(3+4)
-        elif kind == "UNIT" and next_kind in ("NUMBER", "UNIT"):
+        # 右括号后面跟数字或单位或函数: (3+4) 2 → (3+4)*2; (3+4)m → (3+4)*m; (3+4) sin(x) → (3+4)*sin(x)
+        elif kind == "OP" and value == ")" and next_kind in ("NUMBER", "UNIT", "FUNC"):
+            need_implicit_mul = True
+
+        # 单位后面跟数字或单位或左括号或函数:
+        #   m 2 → m*2; m s → m*s; m (3+4) → m*(3+4); m sin(x) → m*sin(x)
+        elif kind == "UNIT" and next_kind in ("NUMBER", "UNIT", "FUNC"):
             need_implicit_mul = True
         elif kind == "UNIT" and next_kind == "OP" and next_val == "(":
+            need_implicit_mul = True
+
+        # 函数后面跟单位或数字: sin(x) 2 → sin(x)*2; sin(x) m → sin(x)*m
+        elif kind == "FUNC" and next_kind in ("NUMBER", "UNIT"):
             need_implicit_mul = True
 
         if need_implicit_mul:
@@ -1202,10 +1336,16 @@ class _ExprParser:
       - 括号: (2 m)^3, 2*(m/s)
     """
 
-    def __init__(self, tokens: List[Tuple[str, str]], registry: UnitRegistry):
+    def __init__(
+        self,
+        tokens: List[Tuple[str, str]],
+        registry: UnitRegistry,
+        variables: Optional[Dict[str, Quantity]] = None
+    ):
         self.tokens = tokens
         self.pos = 0
         self.registry = registry
+        self.variables = variables or {}
 
     def peek(self, offset: int = 0) -> Optional[Tuple[str, str]]:
         idx = self.pos + offset
@@ -1279,10 +1419,166 @@ class _ExprParser:
             return atom
         return self.atom()
 
+    def _apply_function(self, func_name: str, arg: Quantity) -> Quantity:
+        """
+        应用数学函数到 Quantity，并处理量纲检查。
+
+        参数:
+            func_name: 函数名 (sin, cos, sqrt, etc.)
+            arg: 参数 Quantity
+
+        返回:
+            计算结果 Quantity
+        """
+        import math
+
+        # 检查是否是角度单位（用于三角函数）
+        is_trig = func_name in ('sin', 'cos', 'tan')
+        is_inverse_trig = func_name in ('asin', 'acos', 'atan')
+        is_hyperbolic = func_name in ('sinh', 'cosh', 'tanh')
+        is_exponential = func_name in ('exp', 'log', 'ln', 'log10', 'log2')
+        is_power = func_name in ('sqrt',)
+        is_rounding = func_name in ('abs', 'floor', 'ceil', 'round')
+
+        # 获取纯数值（处理角度单位转换）
+        if is_trig or is_hyperbolic:
+            # 三角函数和双曲函数: 参数必须是无量纲或角度单位
+            if arg.dimension.is_dimensionless():
+                # 无量纲，默认弧度
+                value = arg.value_base
+            else:
+                # 检查是否是角度单位
+                try:
+                    # 尝试转换为弧度
+                    rad_value = arg.to_value('rad')
+                    value = rad_value
+                except (DimensionError, KeyError):
+                    try:
+                        # 尝试转换为度再转弧度
+                        deg_value = arg.to_value('deg')
+                        value = math.radians(deg_value)
+                    except (DimensionError, KeyError):
+                        raise DimensionError(
+                            f"函数 '{func_name}' 需要无量纲参数或角度单位 (deg/rad)，"
+                            f"但得到的量纲是 {arg.dimension}\n"
+                            f"  详细: 请使用 sin(90 deg) 或 sin(pi/2 rad) 或 sin(1.57) 的形式。"
+                        )
+        elif is_inverse_trig:
+            # 反三角函数: 参数必须是无量纲，结果是弧度（无量纲）
+            if not arg.dimension.is_dimensionless():
+                raise DimensionError(
+                    f"函数 '{func_name}' 需要无量纲参数，"
+                    f"但得到的量纲是 {arg.dimension}\n"
+                    f"  详细: 反三角函数的输入必须是 -1 到 1 之间的纯数字。"
+                )
+            value = arg.value_base
+        elif is_exponential:
+            # 指数和对数: 参数必须是无量纲
+            if not arg.dimension.is_dimensionless():
+                raise DimensionError(
+                    f"函数 '{func_name}' 需要无量纲参数，"
+                    f"但得到的量纲是 {arg.dimension}\n"
+                    f"  详细: 指数和对数函数只能作用于纯数字。"
+                )
+            value = arg.value_base
+        else:
+            # 其他函数（sqrt, abs, floor, ceil, round）: 可以是任何量纲
+            value = arg.value_base
+
+        # 执行计算
+        if func_name == 'sin':
+            result_value = math.sin(value)
+        elif func_name == 'cos':
+            result_value = math.cos(value)
+        elif func_name == 'tan':
+            result_value = math.tan(value)
+        elif func_name == 'asin':
+            result_value = math.asin(value)
+        elif func_name == 'acos':
+            result_value = math.acos(value)
+        elif func_name == 'atan':
+            result_value = math.atan(value)
+        elif func_name == 'sinh':
+            result_value = math.sinh(value)
+        elif func_name == 'cosh':
+            result_value = math.cosh(value)
+        elif func_name == 'tanh':
+            result_value = math.tanh(value)
+        elif func_name == 'sqrt':
+            result_value = math.sqrt(value)
+        elif func_name == 'exp':
+            result_value = math.exp(value)
+        elif func_name == 'log' or func_name == 'ln':
+            result_value = math.log(value)
+        elif func_name == 'log10':
+            result_value = math.log10(value)
+        elif func_name == 'log2':
+            result_value = math.log2(value)
+        elif func_name == 'abs':
+            result_value = abs(value)
+        elif func_name == 'floor':
+            result_value = math.floor(value)
+        elif func_name == 'ceil':
+            result_value = math.ceil(value)
+        elif func_name == 'round':
+            result_value = round(value)
+        else:
+            raise ParseError(f"未知函数: {func_name}")
+
+        # 确定结果的量纲和单位
+        if is_trig or is_inverse_trig or is_hyperbolic or is_exponential:
+            # 三角函数、反三角函数、双曲函数、指数对数: 结果无量纲
+            result_dim = DIMENSIONLESS
+            result_unit = UnitDef("dimensionless", "1", result_dim)
+            return Quantity(result_value, result_unit, self.registry)
+        elif is_power:
+            # sqrt: 量纲指数除以 2
+            result_dim = arg.dimension ** Fraction(1, 2)
+            # 尝试从原单位推导新单位
+            if arg._unit and arg._unit.offset == 0:
+                # 简单处理：如果原单位是 m^2，结果单位是 m
+                old_sym = arg._unit.symbol
+                # 尝试创建一个简化的单位符号
+                new_sym = f"sqrt({old_sym})" if '^' in old_sym else old_sym
+                try:
+                    result_unit = UnitDef(f"sqrt_{old_sym}", new_sym, result_dim, factor=math.sqrt(arg._unit.factor))
+                    return Quantity(result_value, result_unit, self.registry)
+                except:
+                    pass
+            result_unit = UnitDef("dimensionless", "1", result_dim)
+            return Quantity(result_value, result_unit, self.registry)
+        else:
+            # abs, floor, ceil, round: 保持原有量纲和单位
+            result_dim = arg.dimension
+            if arg._unit:
+                # 保留原单位
+                return Quantity(result_value, arg._unit, self.registry)
+            result_unit = UnitDef("dimensionless", "1", result_dim)
+            return Quantity(result_value, result_unit, self.registry)
+
     def atom(self) -> Quantity:
         tok = self.peek()
         if tok is None:
             raise ParseError("表达式意外结束")
+
+        # 函数调用: func(expr)
+        if tok[0] == "FUNC":
+            func_name = tok[1]
+            self.consume()
+            # 期望左括号
+            lparen = self.peek()
+            if lparen is None or lparen[0] != "OP" or lparen[1] != "(":
+                raise ParseError(f"函数 '{func_name}' 后缺少 '('")
+            self.consume()
+            # 解析参数
+            arg = self.expr()
+            # 期望右括号
+            rparen = self.peek()
+            if rparen is None or rparen[0] != "OP" or rparen[1] != ")":
+                raise ParseError(f"函数 '{func_name}' 的参数缺少 ')'")
+            self.consume()
+            # 应用函数
+            return self._apply_function(func_name, arg)
 
         # 括号
         if tok[0] == "OP" and tok[1] == "(":
@@ -1316,7 +1612,11 @@ class _ExprParser:
 
         # 独立单位 (如 m, kg, s, 或复合单位 m^2/s)
         if tok[0] == "UNIT":
-            # 先检查是否是物理常数
+            # 先检查是否是变量（优先级最高）
+            if tok[1] in self.variables:
+                self.consume()
+                return self.variables[tok[1]]
+            # 再检查是否是物理常数
             const = self.registry.get_constant(tok[1])
             if const is not None:
                 self.consume()
@@ -1416,7 +1716,11 @@ class _ExprParser:
         return unit
 
 
-def parse(expr: str, registry: Optional[UnitRegistry] = None) -> Quantity:
+def parse(
+    expr: str,
+    registry: Optional[UnitRegistry] = None,
+    variables: Optional[Dict[str, Quantity]] = None
+) -> Quantity:
     """
     解析带单位的表达式并返回 Quantity。
 
@@ -1426,6 +1730,7 @@ def parse(expr: str, registry: Optional[UnitRegistry] = None) -> Quantity:
       - 隐式乘法: 2m, 3 kg m/s^2
       - 括号: (2 m)^3, (m/s)^2
       - 单位换算: 100 C to K, 100 km/h to m/s
+      - 变量: 支持在表达式中使用预定义变量（如 ans, v, t 等）
 
     示例:
       parse("5 kg * 9.8 m/s^2")       → 49 N
@@ -1437,6 +1742,7 @@ def parse(expr: str, registry: Optional[UnitRegistry] = None) -> Quantity:
       parse("100 km/h to m/s")        → 27.78 m/s
     """
     reg = registry or DEFAULT_REGISTRY
+    vars_dict = variables or {}
 
     # 先处理 " ... to ..." 语法
     to_target = None
@@ -1451,7 +1757,7 @@ def parse(expr: str, registry: Optional[UnitRegistry] = None) -> Quantity:
         to_target = "".join(v for _, v in tokens[to_idx + 1:])
         tokens = tokens[:to_idx]
 
-    parser = _ExprParser(tokens, reg)
+    parser = _ExprParser(tokens, reg, vars_dict)
     try:
         result = parser.parse()
     except ParseError as e:
@@ -1479,13 +1785,17 @@ def q(value: float, unit: str, registry: Optional[UnitRegistry] = None) -> Quant
 # ─────────────────────────────────────────────
 _BANNER = """
 ╔══════════════════════════════════════════════════════════════╗
-║         量纲分析与单位换算引擎 (交互式) v2.0                  ║
+║         量纲科学计算器 (交互式) v3.0                         ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  输入表达式进行计算，支持:                                   ║
 ║    • 基本运算: 5 kg * 9.8 m/s^2                             ║
 ║    • 隐式乘法: 2m, 3 kg m/s^2                               ║
 ║    • 单位换算: 100 C to K, 100 km/h to m/s                  ║
 ║    • 幂运算: (2 m)^3, m^-2                                  ║
+║    • 数学函数: sin, cos, sqrt, log, exp 等                  ║
+║    • 物理常数: G, c, planck, boltzmann, pi 等               ║
+║    • 变量赋值: let v = 100 km/h  或  v = 100 km/h           ║
+║    • 历史命令: :history 查看, !n 或 !-n 重执行              ║
 ║    • 定义单位: :def 符号 = 表达式   (例如 :def day = 24 h)  ║
 ║    • 定义别名: :alias 新符号 = 原符号                        ║
 ║    • 删除单位: :del 符号                                    ║
@@ -1627,14 +1937,34 @@ _HELP = """
     :list [:search 关键字]  列出所有单位
     :vars                   列出所有变量
     :consts                 列出所有物理常数
+    :history                列出计算历史
     :help                   显示此帮助
     :q / :quit              退出
+
+  历史命令:
+    !n                      重新执行第 n 条历史命令
+    !-n                     重新执行倒数第 n 条命令
+    !!                      重新执行上一条命令 (同 !-1)
 
   变量赋值:
     let v = 100 km/h        定义变量 v
     var v = 100 km/h        同上
     v = 100 km/h            同上
     ans                     上一次计算结果
+
+  数学函数:
+    sin, cos, tan           三角函数 (支持 deg/rad)
+    asin, acos, atan        反三角函数
+    sinh, cosh, tanh        双曲函数
+    sqrt, exp               平方根、自然指数
+    log, ln, log10, log2    对数函数
+    abs, floor, ceil, round 取整函数
+
+  物理常数 (部分常用别名):
+    G, c, R, e              万有引力、光速、气体常数、元电荷
+    planck, boltzmann       h_p (h 被小时占用), k_b (k 被千前缀占用)
+    pi, euler               圆周率 π, 自然对数底 e (e 被元电荷占用)
+    gravity, avogadro       g_0 (g 被克占用), N_A
 """
 
 
@@ -1694,6 +2024,23 @@ def cli() -> int:
     registry = DEFAULT_REGISTRY
     variables: Dict[str, Quantity] = {}
     last_result: Optional[Quantity] = None
+    history: List[Tuple[str, Optional[Quantity]]] = []  # (expression, result)
+
+    def _add_to_history(expr: str, result: Optional[Quantity]) -> None:
+        """添加到历史记录。"""
+        history.append((expr, result))
+
+    def _get_history_entry(n: int) -> Optional[Tuple[str, Optional[Quantity]]]:
+        """获取历史记录条目，支持负数索引。"""
+        if n == 0:
+            return None
+        if n > 0:
+            idx = n - 1
+        else:
+            idx = len(history) + n
+        if 0 <= idx < len(history):
+            return history[idx]
+        return None
 
     try:
         while True:
@@ -1705,23 +2052,43 @@ def cli() -> int:
             if not line:
                 continue
 
+            # 检查历史命令: !n, !-n, !!
+            if line.startswith('!'):
+                if line == '!!':
+                    # 上一条命令
+                    entry = _get_history_entry(-1)
+                else:
+                    try:
+                        n = int(line[1:])
+                        entry = _get_history_entry(n)
+                    except ValueError:
+                        print(f"  错误: 无效的历史命令 '{line}'")
+                        continue
+                
+                if entry is None:
+                    print(f"  错误: 历史记录中没有该条目")
+                    continue
+                
+                expr, _ = entry
+                print(f"  重执行: {expr}")
+                line = expr
+
             # 检查变量赋值: let v = expr 或 var v = expr 或 v = expr
             assignment_match = re.match(r'^(?:let\s+|var\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$', line)
             if assignment_match:
                 var_name = assignment_match.group(1)
                 var_expr = assignment_match.group(2)
                 try:
-                    # 先替换变量
-                    for name, val in reversed(variables.items()):
-                        var_expr = re.sub(r'\b' + re.escape(name) + r'\b', f'({val.value_base:.15g})', var_expr)
-                    # 替换 ans
+                    # 构建包含 ans 的变量字典
+                    parse_vars = dict(variables)
                     if last_result is not None:
-                        var_expr = re.sub(r'\bans\b', f'({last_result.value_base:.15g})', var_expr)
-                    value = parse(var_expr, registry)
+                        parse_vars['ans'] = last_result
+                    value = parse(var_expr, registry, parse_vars)
                     variables[var_name] = value
                     last_result = value
                     print(f"  已定义变量: {var_name} = {value}")
                     _print_result(value, indent="  ")
+                    _add_to_history(line, value)
                 except (ParseError, DimensionError, UnitDefinitionError) as e:
                     print(f"  错误: {e}")
                 except Exception as e:
@@ -1767,29 +2134,72 @@ def cli() -> int:
                         print("  没有已定义的变量。")
                     continue
                 if line == ":consts":
-                    consts = registry.all_constants()
-                    if consts:
+                    consts_info = registry.get_all_constants_info()
+                    if consts_info:
                         print("  物理常数:")
-                        for name, val in consts.items():
-                            print(f"    {name} = {val}")
+                        print()
+                        # 找到最大宽度
+                        sym_w = max(len(info['symbol']) for info in consts_info)
+                        alias_w = max(len(", ".join(info['aliases'])) if info['aliases'] else 0 for info in consts_info)
+                        alias_w = max(alias_w, 10)
+                        
+                        # 打印表头
+                        header = f"  {'符号':<{sym_w}}  {'别名':<{alias_w}}  描述"
+                        print(header)
+                        print(f"  {'─' * sym_w}  {'─' * alias_w}  {'─' * 30}")
+                        
+                        for info in consts_info:
+                            sym = info['symbol']
+                            qty = info['quantity']
+                            aliases = ", ".join(info['aliases']) if info['aliases'] else "-"
+                            note = info['note']
+                            
+                            # 第一行：符号、别名、描述
+                            print(f"  {sym:<{sym_w}}  {aliases:<{alias_w}}  {note}")
+                            # 第二行：数值和量纲
+                            val_str = f"    = {qty.value_in_unit():.6g} {qty._unit.symbol if qty._unit else ''}  [{qty.dimension}]"
+                            print(val_str)
+                            print()
+                        
+                        # 显示冲突提示
+                        conflicts = [info for info in consts_info if '被' in info.get('note', '')]
+                        if conflicts:
+                            print("  💡 提示: 以下常用符号与现有单位冲突，已提供别名:")
+                            for info in conflicts:
+                                print(f"     • {info['note']}")
+                            print()
                     else:
                         print("  没有已注册的物理常数。")
+                    continue
+                if line == ":history":
+                    if not history:
+                        print("  暂无历史记录。")
+                    else:
+                        print("  历史记录:")
+                        print()
+                        print(f"  {'#':>3}  {'表达式':<40}  结果")
+                        print(f"  {'─'*3}  {'─'*40}  {'─'*20}")
+                        for i, (expr, result) in enumerate(history, 1):
+                            result_str = f"{result:.6g}" if result else "(错误)"
+                            expr_display = expr if len(expr) <= 38 else expr[:36] + "..."
+                            print(f"  {i:>3}  {expr_display:<40}  {result_str}")
+                        print()
+                        print("  使用 !n 重执行第 n 条，!-n 重执行倒数第 n 条，!! 重执行上一条")
+                        print()
                     continue
                 print(f"  未知命令: {line}。输入 :help 查看命令列表。")
                 continue
 
             try:
-                # 先替换变量
-                expr = line
-                for name, val in reversed(variables.items()):
-                    expr = re.sub(r'\b' + re.escape(name) + r'\b', f'({val.value_base:.15g})', expr)
-                # 替换 ans
+                # 构建包含 ans 的变量字典
+                parse_vars = dict(variables)
                 if last_result is not None:
-                    expr = re.sub(r'\bans\b', f'({last_result.value_base:.15g})', expr)
+                    parse_vars['ans'] = last_result
                 
-                result = parse(expr, registry)
+                result = parse(line, registry, parse_vars)
                 last_result = result
                 _print_result(result)
+                _add_to_history(line, result)
             except (ParseError, DimensionError, UnitDefinitionError, KeyError) as e:
                 print(f"  错误: {e}")
             except Exception as e:
