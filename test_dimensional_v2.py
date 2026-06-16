@@ -364,6 +364,168 @@ print(f"  标准状态理想气体压强 = {P.to('Pa'):.6g}")
 check("理想气体压强 ≈ 1.01e5 Pa", approx(P.to_value("Pa"), 1.01325e5, rel=0.02))
 
 # ═══════════════════════════════════════════════════════
+# 9. 物理常数
+# ═══════════════════════════════════════════════════════
+print("\n" + "=" * 60)
+print("9. 物理常数")
+print("=" * 60)
+
+reg6 = UnitRegistry()
+
+# 检查常数已注册
+consts = reg6.all_constants()
+check(f"已注册 {len(consts)} 个物理常数", len(consts) >= 9)
+
+# 测试万有引力常数
+G = reg6.get_constant('G')
+check(f"G 已注册: {G}", G is not None)
+check("G 量纲正确", G.dimension == Dimension(length=3, mass=-1, time=-2))
+
+# 测试光速
+c = reg6.get_constant('c')
+check(f"c 已注册: {c}", c is not None)
+check("c 量纲正确", c.dimension == Dimension(length=1, time=-1))
+
+# 测试在表达式中使用常数
+F2 = parse("G * 5.972e24 kg * 1 kg / (6.371e6 m)^2", reg6)
+check(f"G 在表达式中可用: {F2.to('N'):.4g} N", 
+      approx(F2.to_value("N"), 9.8, rel=0.02))
+
+# 测试 5 G 这种写法
+result = parse("5 G", reg6)
+check("5 G = 5 * G", approx(result.value_base, 5 * G.value_base, rel=1e-10))
+
+# 测试质能方程
+E2 = parse("1 kg * c^2", reg6)
+check("E = mc² 量纲正确", E2.dimension == Dimension(mass=1, length=2, time=-2))
+check("E = mc² 数值正确", approx(E2.to_value("J"), 8.98755e16, rel=0.01))
+
+# 测试理想气体常数
+P2 = parse("1 mol * R * 273.15 K / 0.0224 m^3", reg6)
+check("R 在表达式中可用", approx(P2.to_value("Pa"), 1.01325e5, rel=0.02))
+
+# ═══════════════════════════════════════════════════════
+# 10. SI 前缀和新单位
+# ═══════════════════════════════════════════════════════
+print("\n" + "=" * 60)
+print("10. SI 前缀和新单位")
+print("=" * 60)
+
+reg7 = UnitRegistry()
+
+# 测试 SI 前缀
+prefix_tests = [
+    ("1 mm to m", 0.001),
+    ("1 km to m", 1000),
+    ("1 cm to m", 0.01),
+    ("1 um to m", 1e-6),
+    ("1 nm to m", 1e-9),
+    ("1 ms to s", 0.001),
+    ("1 us to s", 1e-6),
+    ("1 ns to s", 1e-9),
+    ("1 MHz to Hz", 1e6),
+    ("1 GHz to Hz", 1e9),
+    ("1 kW to W", 1000),
+    ("1 MeV to eV", 1e6),
+    ("1 GPa to Pa", 1e9),
+]
+
+for expr, expected in prefix_tests:
+    try:
+        result = parse(expr, reg7)
+        val = result.value_base if '/' not in expr.split(' to ')[1] else result.value_base
+        # 解析目标单位并转换
+        target = expr.split(' to ')[1]
+        converted = result.to_value(target)
+        check(f"{expr} = {converted:.4g} {target}", approx(converted, expected, rel=1e-4))
+    except Exception as e:
+        check(f"{expr}", False, str(e)[:60])
+
+# 测试新单位
+new_unit_tests = [
+    ("1 atm to Pa", 101325),
+    ("1 bar to Pa", 1e5),
+    ("1 mmHg to Pa", 133.322),
+    ("1 torr to Pa", 133.322),
+    ("1 psi to Pa", 6894.76),
+    ("1 eV to J", 1.60218e-19),
+    ("1 cal to J", 4.184),
+    ("1 kcal to J", 4184),
+    ("1 kWh to J", 3.6e6),
+    ("1 AU to km", 1.49598e8),
+    ("1 ly to km", 9.46073e12),
+    ("1 pc to ly", 3.26156),
+]
+
+for expr, expected in new_unit_tests:
+    try:
+        target = expr.split(' to ')[1]
+        result = parse(expr, reg7)
+        converted = result.to_value(target)
+        check(f"{expr} = {converted:.4g} {target}", approx(converted, expected, rel=1e-3))
+    except Exception as e:
+        check(f"{expr}", False, str(e)[:60])
+
+# ═══════════════════════════════════════════════════════
+# 11. 错误处理收紧
+# ═══════════════════════════════════════════════════════
+print("\n" + "=" * 60)
+print("11. 错误处理收紧")
+print("=" * 60)
+
+# 测试无效字符
+try:
+    parse("1 m @ 2 s", reg7)
+    check("无效字符 @ 应报错", False, "没有报错")
+except ParseError as e:
+    check(f"无效字符 @ 报错: {e}", "无效字符" in str(e) or "@" in str(e))
+except Exception as e:
+    check(f"无效字符 @ 报错类型错误", False, str(e)[:60])
+
+# 测试未知单位
+try:
+    parse("5 xyz", reg7)
+    check("未知单位 xyz 应报错", False, "没有报错")
+except (ParseError, KeyError) as e:
+    check(f"未知单位 xyz 报错: {str(e)[:50]}", "xyz" in str(e))
+except Exception as e:
+    check(f"未知单位 xyz 报错类型错误", False, str(e)[:60])
+
+# 测试夹杂奇怪符号
+try:
+    parse("1 m # 2 s", reg7)
+    check("无效字符 # 应报错", False, "没有报错")
+except ParseError as e:
+    check(f"无效字符 # 报错: {e}", "无效字符" in str(e) or "#" in str(e))
+except Exception as e:
+    check(f"无效字符 # 报错类型错误", False, str(e)[:60])
+
+# 测试 CLI 退出码
+import subprocess
+import sys
+
+cli_tests = [
+    ("1 m @ 2 s", 1),  # 无效字符，应返回 1
+    ("5 xyz", 1),      # 未知单位，应返回 1
+    ("1 m to kg", 1),  # 量纲不匹配，应返回 1
+    ("1 m to xyz", 1), # 未知目标单位，应返回 1
+    ("1 m", 0),        # 正确，应返回 0
+]
+
+for expr, expected_exit in cli_tests:
+    try:
+        result = subprocess.run(
+            [sys.executable, 'dimensional_engine.py', expr],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=10
+        )
+        has_tb = "Traceback" in result.stdout or "Traceback" in result.stderr
+        check(f"CLI: '{expr}' → exit={result.returncode}, tb={has_tb}",
+              result.returncode == expected_exit and not has_tb)
+    except Exception as e:
+        check(f"CLI: '{expr}' 执行失败", False, str(e)[:60])
+
+# ═══════════════════════════════════════════════════════
 # 汇总
 # ═══════════════════════════════════════════════════════
 print("\n" + "=" * 60)

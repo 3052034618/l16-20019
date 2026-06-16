@@ -287,6 +287,37 @@ def parse_unit_symbol(symbol: str, registry: "UnitRegistry") -> Optional[UnitDef
     """解析复合单位符号，如 m/s^2、kg*m/s^2 等。"""
     if not symbol or not symbol.strip():
         return None
+    
+    # 先尝试直接查找（不带前缀解析，避免无限递归）
+    if symbol in registry._units:
+        return registry._units[symbol]
+    if symbol in registry._aliases:
+        return registry._units[registry._aliases[symbol]]
+    
+    # 尝试 SI 前缀解析（手动实现，不调用 registry.get 避免递归）
+    for prefix in sorted(registry._SI_PREFIXES.keys(), key=len, reverse=True):
+        if symbol.startswith(prefix) and len(symbol) > len(prefix):
+            base_symbol = symbol[len(prefix):]
+            # 只查找基本单位，不递归
+            base_unit = None
+            if base_symbol in registry._units:
+                base_unit = registry._units[base_symbol]
+            elif base_symbol in registry._aliases:
+                base_unit = registry._units[registry._aliases[base_symbol]]
+            
+            if base_unit is not None:
+                # 对于带 offset 的温度单位，不支持前缀
+                if base_unit.offset != 0:
+                    continue
+                exp, prefix_name = registry._SI_PREFIXES[prefix]
+                factor = 10 ** exp
+                new_symbol = f"{prefix}{base_symbol}"
+                new_name = f"{prefix_name}{base_unit.name}"
+                new_unit = UnitDef(new_name, new_symbol, base_unit.dimension, factor * base_unit.factor, 0.0)
+                registry._units[new_symbol] = new_unit
+                return new_unit
+    
+    # 最后尝试用 UnitSymbolParser 解析复合单位
     try:
         parser = UnitSymbolParser(symbol, registry)
         return parser.parse()
@@ -300,9 +331,36 @@ def parse_unit_symbol(symbol: str, registry: "UnitRegistry") -> Optional[UnitDef
 class UnitRegistry:
     """单位注册表，管理所有已知单位及其别名。"""
 
+    # SI 前缀 (前缀符号 -> (10的指数, 前缀名称))
+    _SI_PREFIXES = {
+        'Y': (24, 'yotta'),
+        'Z': (21, 'zetta'),
+        'E': (18, 'exa'),
+        'P': (15, 'peta'),
+        'T': (12, 'tera'),
+        'G': (9, 'giga'),
+        'M': (6, 'mega'),
+        'k': (3, 'kilo'),
+        'h': (2, 'hecto'),
+        'da': (1, 'deca'),
+        'd': (-1, 'deci'),
+        'c': (-2, 'centi'),
+        'm': (-3, 'milli'),
+        'μ': (-6, 'micro'),
+        'u': (-6, 'micro'),
+        'n': (-9, 'nano'),
+        'p': (-12, 'pico'),
+        'f': (-15, 'femto'),
+        'a': (-18, 'atto'),
+        'z': (-21, 'zepto'),
+        'y': (-24, 'yocto'),
+    }
+
     def __init__(self):
         self._units: Dict[str, UnitDef] = {}
         self._aliases: Dict[str, str] = {}
+        self._constants: Dict[str, Quantity] = {}
+        self._constants_initialized = False
         self._init_all()
 
     # ─── 公共 API ───────────────────────────
@@ -401,13 +459,21 @@ class UnitRegistry:
         return False
 
     def get(self, symbol: str) -> Optional[UnitDef]:
-        """获取单位，自动解析复合单位和别名。"""
+        """获取单位，自动解析复合单位、别名和 SI 前缀。"""
         if symbol in self._units:
             return self._units[symbol]
         if symbol in self._aliases:
             return self._units[self._aliases[symbol]]
-        # 尝试解析复合单位
+        # parse_unit_symbol 会处理 SI 前缀和复合单位解析
         return parse_unit_symbol(symbol, self)
+
+    def _get_base_unit(self, symbol: str) -> Optional[UnitDef]:
+        """获取基本单位（不带前缀的），仅用于前缀解析。"""
+        if symbol in self._units:
+            return self._units[symbol]
+        if symbol in self._aliases:
+            return self._units[self._aliases[symbol]]
+        return None
 
     def __getitem__(self, symbol: str) -> UnitDef:
         u = self.get(symbol)
@@ -416,7 +482,7 @@ class UnitRegistry:
         return u
 
     def __contains__(self, symbol: str) -> bool:
-        return self.get(symbol) is not None
+        return self.get(symbol) is not None or symbol in self._constants
 
     def all_units(self) -> Dict[str, UnitDef]:
         """返回所有已注册主单位的副本。"""
@@ -425,6 +491,48 @@ class UnitRegistry:
     def all_aliases(self) -> Dict[str, str]:
         """返回所有别名映射。"""
         return dict(self._aliases)
+
+    def register_constant(self, symbol: str, quantity: Quantity) -> None:
+        """
+        注册物理常数。
+
+        参数
+        ----
+        symbol : str       常数符号 (如 'G', 'c', 'h')
+        quantity : Quantity  常数值（带单位）
+
+        示例:
+            register_constant('G', parse('6.67430e-11 m^3/kg/s^2'))
+            register_constant('c', parse('299792458 m/s'))
+        """
+        if symbol in self._constants:
+            raise UnitDefinitionError(
+                f"常数 '{symbol}' 已存在。"
+            )
+        if symbol in self._units or symbol in self._aliases:
+            raise UnitDefinitionError(
+                f"符号 '{symbol}' 已被单位占用，请使用其他符号。"
+            )
+        self._constants[symbol] = quantity
+
+    def _ensure_constants_initialized(self) -> None:
+        """确保常数已初始化（延迟初始化）。"""
+        if self._constants_initialized:
+            return
+        # 检查 Quantity 是否已定义
+        if 'Quantity' in globals():
+            self._init_constants()
+            self._constants_initialized = True
+
+    def get_constant(self, symbol: str) -> Optional[Quantity]:
+        """获取物理常数，不存在返回 None。"""
+        self._ensure_constants_initialized()
+        return self._constants.get(symbol)
+
+    def all_constants(self) -> Dict[str, Quantity]:
+        """返回所有已注册物理常数的副本。"""
+        self._ensure_constants_initialized()
+        return dict(self._constants)
 
     # ─── 内部方法 ───────────────────────────
     def _resolve_alias(self, symbol: str) -> str:
@@ -487,6 +595,9 @@ class UnitRegistry:
         self._init_imperial()
         self._init_temperature()
         self._init_derived()
+        self._init_pressure()
+        self._init_energy()
+        self._init_astronomical()
         self._init_aliases()
 
     def _init_si(self):
@@ -555,6 +666,137 @@ class UnitRegistry:
         self.alias("°C", "C")
         self.alias("°F", "F")
         self.alias("°K", "K")
+
+    def _init_pressure(self):
+        """初始化压强单位。"""
+        self.register(UnitDef("bar", "bar", Dimension(mass=1, length=-1, time=-2), factor=1e5))
+        self.register(UnitDef("millibar", "mbar", Dimension(mass=1, length=-1, time=-2), factor=100))
+        self.register(UnitDef("mmHg", "mmHg", Dimension(mass=1, length=-1, time=-2), factor=133.3223684))
+        self.register(UnitDef("torr", "torr", Dimension(mass=1, length=-1, time=-2), factor=133.3223684))
+        self.register(UnitDef("atmosphere", "atm", Dimension(mass=1, length=-1, time=-2), factor=101325))
+        self.register(UnitDef("psi", "psi", Dimension(mass=1, length=-1, time=-2), factor=6894.75729))
+
+    def _init_energy(self):
+        """初始化能量单位。"""
+        self.register(UnitDef("electronvolt", "eV", Dimension(mass=1, length=2, time=-2), factor=1.602176634e-19))
+        self.register(UnitDef("calorie", "cal", Dimension(mass=1, length=2, time=-2), factor=4.184))
+        self.register(UnitDef("kilocalorie", "kcal", Dimension(mass=1, length=2, time=-2), factor=4184))
+        self.register(UnitDef("watt_hour", "Wh", Dimension(mass=1, length=2, time=-2), factor=3600))
+        self.register(UnitDef("kilowatt_hour", "kWh", Dimension(mass=1, length=2, time=-2), factor=3.6e6))
+
+    def _init_astronomical(self):
+        """初始化天文单位。"""
+        self.register(UnitDef("astronomical_unit", "AU", Dimension(length=1), factor=1.495978707e11))
+        self.register(UnitDef("light_year", "ly", Dimension(length=1), factor=9.4607304725808e15))
+        self.register(UnitDef("parsec", "pc", Dimension(length=1), factor=3.0856775814913673e16))
+        self.register(UnitDef("solar_mass", "M_sun", Dimension(mass=1), factor=1.98847e30))
+        self.register(UnitDef("earth_mass", "M_earth", Dimension(mass=1), factor=5.9722e24))
+
+    def _init_constants(self):
+        """初始化常用物理常数。"""
+        if self._constants_initialized:
+            return
+        # 万有引力常数
+        self.register_constant(
+            'G',
+            Quantity.from_base(
+                6.67430e-11,
+                Dimension(length=3, mass=-1, time=-2),
+                registry=self
+            )
+        )
+        # 光速
+        self.register_constant(
+            'c',
+            Quantity.from_base(
+                299792458.0,
+                Dimension(length=1, time=-1),
+                registry=self
+            )
+        )
+        # 普朗克常数 (h 被小时占用，使用 h_p)
+        self.register_constant(
+            'h_p',
+            Quantity.from_base(
+                6.62607015e-34,
+                Dimension(mass=1, length=2, time=-1),
+                registry=self
+            )
+        )
+        # 约化普朗克常数
+        import math
+        self.register_constant(
+            'hbar',
+            Quantity.from_base(
+                6.62607015e-34 / (2 * math.pi),
+                Dimension(mass=1, length=2, time=-1),
+                registry=self
+            )
+        )
+        # 玻尔兹曼常数
+        self.register_constant(
+            'k_b',
+            Quantity.from_base(
+                1.380649e-23,
+                Dimension(mass=1, length=2, time=-2, temperature=-1),
+                registry=self
+            )
+        )
+        # 理想气体常数
+        self.register_constant(
+            'R',
+            Quantity.from_base(
+                8.314462618,
+                Dimension(mass=1, length=2, time=-2, temperature=-1, amount=-1),
+                registry=self
+            )
+        )
+        # 元电荷
+        self.register_constant(
+            'e',
+            Quantity.from_base(
+                1.602176634e-19,
+                Dimension(current=1, time=1),
+                registry=self
+            )
+        )
+        # 阿伏伽德罗常数
+        self.register_constant(
+            'N_A',
+            Quantity.from_base(
+                6.02214076e23,
+                Dimension(amount=-1),
+                registry=self
+            )
+        )
+        # 标准重力加速度 (g 被克占用，使用 g_0)
+        self.register_constant(
+            'g_0',
+            Quantity.from_base(
+                9.80665,
+                Dimension(length=1, time=-2),
+                registry=self
+            )
+        )
+        # 标准大气压 (已作为单位注册，不再作为常数)
+        # self.register_constant(
+        #     'atm',
+        #     Quantity.from_base(
+        #         101325.0,
+        #         Dimension(mass=1, length=-1, time=-2),
+        #         registry=self
+        #     )
+        # )
+        self._constants_initialized = True
+        # 电子伏特 (已作为单位注册，不再作为常数)
+        # self.register_constant(
+        #     'eV',
+        #     Quantity.from_base(
+        #         1.602176634e-19,
+        #         Dimension(mass=1, length=2, time=-2),
+        #         registry=self
+        #     )
+        # )
 
 
 DEFAULT_REGISTRY = UnitRegistry()
@@ -868,6 +1110,10 @@ _EXPR_TOKEN_RE = re.compile(r"""
 """, re.VERBOSE)
 
 
+# 初始化物理常数（必须在 Quantity 类定义完成之后）
+DEFAULT_REGISTRY._init_constants()
+
+
 def _expr_tokenize(expr: str) -> List[Tuple[str, str]]:
     """
     表达式分词。分词后会插入隐式乘号，例如:
@@ -876,15 +1122,32 @@ def _expr_tokenize(expr: str) -> List[Tuple[str, str]]:
       "(1+2)m"   → OP((), NUMBER(1), OP(+), NUMBER(2), OP()), OP(*), UNIT(m)
     """
     raw_tokens: List[Tuple[str, str]] = []
+    last_end = 0
     for m in _EXPR_TOKEN_RE.finditer(expr):
         kind = m.lastgroup
         value = m.group()
+        
+        # 先检查是否有未匹配的字符（无效字符）
+        if m.start() > last_end:
+            invalid = expr[last_end:m.start()]
+            if invalid.strip():
+                raise ParseError(f"表达式中包含无效字符: '{invalid}'")
+        
+        # 然后更新 last_end
+        last_end = m.end()
+        
         if kind == "WS":
             continue
         if kind == "TO":
             raw_tokens.append(("TO", "to"))
             continue
         raw_tokens.append((kind, value))
+    
+    # 检查表达式末尾是否有未匹配的字符
+    if last_end < len(expr):
+        invalid = expr[last_end:]
+        if invalid.strip():
+            raise ParseError(f"表达式末尾包含无效字符: '{invalid}'")
 
     # 插入隐式乘号
     tokens: List[Tuple[str, str]] = []
@@ -1039,6 +1302,12 @@ class _ExprParser:
             if next_tok and next_tok[0] == "UNIT":
                 # 数字后面跟单位: 解析为 系数 × 复合单位
                 unit_def = self._parse_compound_unit()
+                if unit_def is None:
+                    # 返回 None 表示后面是常数，不是单位，处理为 数字 * 常数
+                    const = self.atom()
+                    dimless = UnitDef("dimensionless", "1", DIMENSIONLESS)
+                    num_qty = Quantity(value, dimless, self.registry)
+                    return num_qty * const
                 return Quantity(value, unit_def, self.registry)
             else:
                 # 只是一个纯数字
@@ -1047,7 +1316,15 @@ class _ExprParser:
 
         # 独立单位 (如 m, kg, s, 或复合单位 m^2/s)
         if tok[0] == "UNIT":
+            # 先检查是否是物理常数
+            const = self.registry.get_constant(tok[1])
+            if const is not None:
+                self.consume()
+                return const
+            # 否则解析为单位
             unit_def = self._parse_compound_unit()
+            if unit_def is None:
+                raise ParseError(f"无法解析单位符号: '{tok[1]}'")
             return Quantity(1.0, unit_def, self.registry)
 
         raise ParseError(f"意外的标记: {tok}")
@@ -1074,6 +1351,9 @@ class _ExprParser:
             kind, value = self.tokens[self.pos]
 
             if kind == "UNIT":
+                # 先检查是否是物理常数，如果是，停止解析
+                if self.registry.get_constant(value) is not None:
+                    break
                 # 单位符号，直接收集
                 collected.append(("UNIT", value))
                 self.pos += 1
@@ -1092,14 +1372,14 @@ class _ExprParser:
                 self.pos += 1
 
             elif kind == "OP" and value in ("*", "/"):
-                # 乘除运算符：只有下一个 token 是 UNIT 时才属于单位符号
+                # 乘除运算符：只有下一个 token 是 UNIT 且不是常数时才属于单位符号
                 if self.pos + 1 < len(self.tokens):
-                    next_kind, _ = self.tokens[self.pos + 1]
-                    if next_kind == "UNIT":
+                    next_kind, next_val = self.tokens[self.pos + 1]
+                    if next_kind == "UNIT" and self.registry.get_constant(next_val) is None:
                         collected.append(("OP", value))
                         self.pos += 1
                     else:
-                        # 下一个不是 UNIT，停止解析，这个运算符留给表达式
+                        # 下一个不是 UNIT 或是常数，停止解析，这个运算符留给表达式
                         break
                 else:
                     break
@@ -1109,17 +1389,19 @@ class _ExprParser:
                 break
 
         if not collected:
-            raise ParseError("期望单位符号")
+            # 返回 None 表示没有解析到任何单位符号，调用者需要处理
+            return None
 
-        # 特殊情况: 如果只解析到单个单位符号，直接返回注册表中的原始 UnitDef
-        # 这样可以保留 offset 信息（如 °C, °F 的温度偏移）
+        # 特殊情况: 如果只解析到单个单位符号，先尝试通过 registry.get() 获取
+        # 这样可以触发 SI 前缀的动态解析
         if len(collected) == 1 and collected[0][0] == "UNIT":
             symbol = collected[0][1]
-            unit = self.registry._units.get(symbol)
-            if unit is None:
-                alias = self.registry._aliases.get(symbol)
-                if alias is not None:
-                    unit = self.registry._units.get(alias)
+            # 先检查是否是物理常数，如果是，不消耗 token，让表达式层面处理
+            if self.registry.get_constant(symbol) is not None:
+                self.pos -= 1
+                return None
+            # 调用 registry.get() 触发前缀解析
+            unit = self.registry.get(symbol)
             if unit is not None:
                 return unit
 
@@ -1343,8 +1625,16 @@ _HELP = """
     :alias 新 = 原          定义别名 (例: :alias 米 = m)
     :del 符号               删除单位或别名
     :list [:search 关键字]  列出所有单位
+    :vars                   列出所有变量
+    :consts                 列出所有物理常数
     :help                   显示此帮助
     :q / :quit              退出
+
+  变量赋值:
+    let v = 100 km/h        定义变量 v
+    var v = 100 km/h        同上
+    v = 100 km/h            同上
+    ans                     上一次计算结果
 """
 
 
@@ -1373,7 +1663,7 @@ def cli() -> int:
             expr = " ".join(args)
 
         if not expr:
-            print("请提供表达式。使用 -h 查看帮助。")
+            print("错误: 请提供表达式。使用 -h 查看帮助。")
             return 1
 
         try:
@@ -1382,6 +1672,10 @@ def cli() -> int:
             return 0
         except (ParseError, DimensionError, UnitDefinitionError) as e:
             print(f"错误: {e}")
+            return 1
+        except Exception as e:
+            # 捕获所有其他异常，不输出 traceback
+            print(f"错误: 处理表达式时发生未知错误 - {e}")
             return 1
 
     # 帮助模式
@@ -1398,6 +1692,8 @@ def cli() -> int:
     # 交互式模式
     print(_BANNER)
     registry = DEFAULT_REGISTRY
+    variables: Dict[str, Quantity] = {}
+    last_result: Optional[Quantity] = None
 
     try:
         while True:
@@ -1409,6 +1705,29 @@ def cli() -> int:
             if not line:
                 continue
 
+            # 检查变量赋值: let v = expr 或 var v = expr 或 v = expr
+            assignment_match = re.match(r'^(?:let\s+|var\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$', line)
+            if assignment_match:
+                var_name = assignment_match.group(1)
+                var_expr = assignment_match.group(2)
+                try:
+                    # 先替换变量
+                    for name, val in reversed(variables.items()):
+                        var_expr = re.sub(r'\b' + re.escape(name) + r'\b', f'({val.value_base:.15g})', var_expr)
+                    # 替换 ans
+                    if last_result is not None:
+                        var_expr = re.sub(r'\bans\b', f'({last_result.value_base:.15g})', var_expr)
+                    value = parse(var_expr, registry)
+                    variables[var_name] = value
+                    last_result = value
+                    print(f"  已定义变量: {var_name} = {value}")
+                    _print_result(value, indent="  ")
+                except (ParseError, DimensionError, UnitDefinitionError) as e:
+                    print(f"  错误: {e}")
+                except Exception as e:
+                    print(f"  错误: 定义变量时发生未知错误 - {e}")
+                continue
+
             if line.startswith(":"):
                 if line in (":q", ":quit", ":exit"):
                     break
@@ -1416,25 +1735,65 @@ def cli() -> int:
                     print(_HELP)
                     continue
                 if line.startswith(":def"):
-                    _cli_define(line[4:], registry)
+                    try:
+                        _cli_define(line[4:], registry)
+                    except Exception as e:
+                        print(f"  错误: {e}")
                     continue
                 if line.startswith(":alias"):
-                    _cli_alias(line[6:], registry)
+                    try:
+                        _cli_alias(line[6:], registry)
+                    except Exception as e:
+                        print(f"  错误: {e}")
                     continue
                 if line.startswith(":del"):
-                    _cli_delete(line[4:], registry)
+                    try:
+                        _cli_delete(line[4:], registry)
+                    except Exception as e:
+                        print(f"  错误: {e}")
                     continue
                 if line.startswith(":list"):
-                    _cli_list(line[5:], registry)
+                    try:
+                        _cli_list(line[5:], registry)
+                    except Exception as e:
+                        print(f"  错误: {e}")
+                    continue
+                if line == ":vars":
+                    if variables:
+                        print("  已定义变量:")
+                        for name, val in variables.items():
+                            print(f"    {name} = {val}")
+                    else:
+                        print("  没有已定义的变量。")
+                    continue
+                if line == ":consts":
+                    consts = registry.all_constants()
+                    if consts:
+                        print("  物理常数:")
+                        for name, val in consts.items():
+                            print(f"    {name} = {val}")
+                    else:
+                        print("  没有已注册的物理常数。")
                     continue
                 print(f"  未知命令: {line}。输入 :help 查看命令列表。")
                 continue
 
             try:
-                result = parse(line, registry)
+                # 先替换变量
+                expr = line
+                for name, val in reversed(variables.items()):
+                    expr = re.sub(r'\b' + re.escape(name) + r'\b', f'({val.value_base:.15g})', expr)
+                # 替换 ans
+                if last_result is not None:
+                    expr = re.sub(r'\bans\b', f'({last_result.value_base:.15g})', expr)
+                
+                result = parse(expr, registry)
+                last_result = result
                 _print_result(result)
             except (ParseError, DimensionError, UnitDefinitionError, KeyError) as e:
                 print(f"  错误: {e}")
+            except Exception as e:
+                print(f"  错误: 计算时发生未知错误 - {e}")
 
     except KeyboardInterrupt:
         print("\n\n再见!")
